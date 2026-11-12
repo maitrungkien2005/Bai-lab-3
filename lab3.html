@@ -1,0 +1,389 @@
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Fire Alarm IoT</title>
+
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #eef2f7;
+  margin: 0;
+  padding: 20px;
+  color: #263445;
+}
+
+.container {
+  max-width: 950px;
+  margin: auto;
+}
+
+h1 {
+  text-align: center;
+  color: #d93025;
+}
+
+.card-container {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 15px;
+}
+
+.card {
+  background: white;
+  padding: 22px;
+  border-radius: 12px;
+  text-align: center;
+  box-shadow: 0 2px 8px #0001;
+}
+
+.value {
+  font-size: 35px;
+  font-weight: bold;
+  margin: 12px;
+}
+
+.gas { color: #1685d5; }
+.temp { color: #e67e22; }
+
+.chart-box {
+  background: white;
+  margin-top: 20px;
+  padding: 20px;
+  border-radius: 12px;
+}
+
+.control {
+  background: white;
+  padding: 20px;
+  margin-top: 20px;
+  border-radius: 12px;
+}
+
+.device {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 18px 0;
+}
+
+button {
+  border: none;
+  padding: 12px 25px;
+  border-radius: 8px;
+  color: white;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.on { background: #16a34a; }
+.off { background: #dc2626; }
+
+#connection {
+  text-align: center;
+  margin: 15px;
+  color: #d97706;
+}
+
+@media(max-width: 600px) {
+  .card-container {
+    grid-template-columns: 1fr;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>FIRE ALARM SYSTEM</h1>
+
+<div id="connection">Đang kết nối MQTT...</div>
+
+<!-- HIEN THI DU LIEU -->
+<div class="card-container">
+
+  <div class="card">
+    <h3>Nồng độ khí Gas / Khói</h3>
+    <div class="value gas" id="gas">--</div>
+    <p>Giá trị ADC</p>
+  </div>
+
+  <div class="card">
+    <h3>Nhiệt độ môi trường</h3>
+    <div class="value temp" id="temperature">--</div>
+    <p>Đơn vị: °C</p>
+  </div>
+
+</div>
+
+<!-- BIEU DO GAS -->
+<div class="chart-box">
+  <h3>Biểu đồ nồng độ khí Gas</h3>
+  <canvas id="gasChart"></canvas>
+</div>
+
+<!-- BIEU DO NHIET DO -->
+<div class="chart-box">
+  <h3>Biểu đồ nhiệt độ</h3>
+  <canvas id="tempChart"></canvas>
+</div>
+
+<!-- DIEU KHIEN -->
+<div class="control">
+
+  <h2>Điều khiển thiết bị - MANUAL</h2>
+
+  <div class="device">
+    <div>
+      <h3>Máy bơm</h3>
+      <span id="pumpState">OFF</span>
+    </div>
+
+    <button id="pumpButton"
+            class="off"
+            onclick="togglePump()">
+      BẬT
+    </button>
+  </div>
+
+  <hr>
+
+  <div class="device">
+    <div>
+      <h3>Quạt thông gió</h3>
+      <span id="fanState">OFF</span>
+    </div>
+
+    <button id="fanButton"
+            class="off"
+            onclick="toggleFan()">
+      BẬT
+    </button>
+  </div>
+
+</div>
+
+</div>
+
+<script>
+
+// ===== MQTT CONFIGURATION =====
+
+const broker = "wss://broker.hivemq.com:8884/mqtt";
+
+const gasTopic = "firealarm/demo/gas";
+const tempTopic = "firealarm/demo/temperature";
+
+const pumpCmd = "firealarm/demo/pump/cmd";
+const fanCmd = "firealarm/demo/fan/cmd";
+
+const pumpStateTopic = "firealarm/demo/pump/state";
+const fanStateTopic = "firealarm/demo/fan/state";
+
+// ===== CONNECT MQTT =====
+
+const client = mqtt.connect(broker);
+
+let pumpStatus = false;
+let fanStatus = false;
+
+client.on("connect", function() {
+
+  document.getElementById("connection").innerText =
+    "MQTT CONNECTED";
+
+  client.subscribe([
+    gasTopic,
+    tempTopic,
+    pumpStateTopic,
+    fanStateTopic
+  ]);
+
+});
+
+client.on("offline", function() {
+  document.getElementById("connection").innerText =
+    "MQTT OFFLINE";
+});
+
+client.on("error", function(error) {
+  console.log("MQTT Error:", error);
+});
+
+// ===== CHART CONFIG =====
+
+let labels = [];
+
+let gasData = [];
+let tempData = [];
+
+const gasChart = new Chart(
+  document.getElementById("gasChart"),
+  {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [{
+        label: "Gas ADC",
+        data: gasData,
+        borderColor: "#1685d5",
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      animation: false
+    }
+  }
+);
+
+const tempChart = new Chart(
+  document.getElementById("tempChart"),
+  {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [{
+        label: "Temperature (°C)",
+        data: tempData,
+        borderColor: "#e67e22",
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      animation: false
+    }
+  }
+);
+
+// ===== RECEIVE DATA =====
+
+client.on("message", function(topic, message) {
+
+  let value = message.toString();
+
+  if (topic === gasTopic) {
+
+    let gas = Number(value);
+
+    if (!Number.isFinite(gas)) return;
+
+    document.getElementById("gas").innerText = gas;
+
+    updateChart("gas", gas);
+  }
+
+  if (topic === tempTopic) {
+
+    let temp = Number(value);
+
+    if (!Number.isFinite(temp)) return;
+
+    document.getElementById("temperature").innerText =
+      temp.toFixed(2) + " °C";
+
+    updateChart("temp", temp);
+  }
+
+  if (topic === pumpStateTopic) {
+    pumpStatus = value === "ON";
+    updateButton("pump", pumpStatus);
+  }
+
+  if (topic === fanStateTopic) {
+    fanStatus = value === "ON";
+    updateButton("fan", fanStatus);
+  }
+
+});
+
+// ===== UPDATE CHART =====
+
+function updateChart(type, value) {
+
+  let time = new Date().toLocaleTimeString();
+
+  if (labels.length === 0 || labels[labels.length - 1] !== time) {
+    labels.push(time);
+  }
+
+  // Moi lan cap nhat them mot gia tri cho tung bieu do
+  // Vi du: 2 topic cung gui theo chu ky 2 giay
+
+  if (type === "gas") {
+    gasData.push(value);
+  } else {
+    tempData.push(value);
+  }
+
+  // Gioi han 20 diem du lieu
+  while (labels.length > 20) {
+    labels.shift();
+  }
+
+  while (gasData.length > 20) {
+    gasData.shift();
+  }
+
+  while (tempData.length > 20) {
+    tempData.shift();
+  }
+
+  gasChart.update("none");
+  tempChart.update("none");
+}
+
+// ===== UPDATE BUTTON =====
+
+function updateButton(device, status) {
+
+  const button = document.getElementById(
+    device + "Button"
+  );
+
+  const state = document.getElementById(
+    device + "State"
+  );
+
+  state.innerText = status ? "ON" : "OFF";
+
+  button.innerText = status ? "TẮT" : "BẬT";
+
+  button.className = status ? "on" : "off";
+}
+
+// ===== CONTROL PUMP =====
+
+function togglePump() {
+
+  if (!client.connected) return;
+
+  const command = pumpStatus ? "OFF" : "ON";
+
+  client.publish(pumpCmd, command);
+}
+
+// ===== CONTROL FAN =====
+
+function toggleFan() {
+
+  if (!client.connected) return;
+
+  const command = fanStatus ? "OFF" : "ON";
+
+  client.publish(fanCmd, command);
+}
+
+</script>
+
+</body>
+</html>
