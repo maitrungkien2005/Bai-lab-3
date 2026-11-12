@@ -1,0 +1,372 @@
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// =================================
+// 1. KHAI BAO CHAN
+// =================================
+
+#define MQ2_PIN 34
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+#define PUMP_PIN 26
+#define FAN_PIN 27
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// =================================
+// 2. CAU HINH WIFI VA MQTT
+// =================================
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+const char* gasTopic = "firealarm/rtos/gas";
+const char* tempTopic = "firealarm/rtos/temperature";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// =================================
+// 3. NGUONG CANH BAO
+// =================================
+
+#define GAS_THRESHOLD 1800
+#define TEMP_THRESHOLD 50.0
+
+// =================================
+// 4. CAU TRUC DU LIEU CAM BIEN
+// =================================
+
+typedef struct {
+  int gasValue;
+  float temperature;
+  bool tempValid;
+} SensorData;
+
+// =================================
+// 5. KHAI BAO QUEUE
+// =================================
+
+QueueHandle_t dataQueue;
+QueueHandle_t alertQueue;
+
+// =================================
+// 6. KHAI BAO TASK
+// =================================
+
+void TaskReadData(void *pvParameters);
+void TaskSendData(void *pvParameters);
+void TaskAlert(void *pvParameters);
+
+// =================================
+// 7. KET NOI WIFI
+// =================================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.println("Connecting WiFi...");
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.println(WiFi.localIP());
+}
+
+// =================================
+// 8. KET NOI MQTT
+// =================================
+
+void connectMQTT() {
+
+  while (!mqttClient.connected()) {
+
+    Serial.println("Connecting MQTT...");
+
+    String clientId = "ESP32-RTOS-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (mqttClient.connect(clientId.c_str())) {
+
+      Serial.println("MQTT Connected!");
+
+    } else {
+
+      Serial.print("MQTT failed, state: ");
+      Serial.println(mqttClient.state());
+
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+  }
+}
+
+// =================================
+// 9. TASK DOC DU LIEU - CORE 1
+// =================================
+
+void TaskReadData(void *pvParameters) {
+
+  SensorData sensor;
+
+  for (;;) {
+
+    // Doc MQ2
+    sensor.gasValue = analogRead(MQ2_PIN);
+
+    // Doc nhiet do DHT22
+    sensor.temperature = dht.readTemperature();
+
+    sensor.tempValid = !isnan(sensor.temperature);
+
+    // Hien thi Serial
+    Serial.println("\n===== SENSOR DATA =====");
+
+    Serial.print("Gas MQ2: ");
+    Serial.println(sensor.gasValue);
+
+    if (sensor.tempValid) {
+      Serial.print("Temperature: ");
+      Serial.print(sensor.temperature);
+      Serial.println(" C");
+    } else {
+      Serial.println("Temperature sensor error!");
+    }
+
+    Serial.println("=======================");
+
+    // Gui du lieu vao data Queue
+    if (xQueueSend(dataQueue, &sensor, 0) != pdPASS) {
+      Serial.println("Data Queue is full!");
+    }
+
+    // Gui du lieu vao alert Queue
+    // Queue co 1 phan tu, luu mau moi nhat
+    xQueueOverwrite(alertQueue, &sensor);
+
+    // Chu ky doc cam bien 2 giay
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+// =================================
+// 10. TASK TRUYEN DATA - CORE 0
+// =================================
+
+void TaskSendData(void *pvParameters) {
+
+  SensorData receivedData;
+
+  for (;;) {
+
+    // Ket noi WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+      connectWiFi();
+    }
+
+    // Ket noi MQTT
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    }
+
+    mqttClient.loop();
+
+    // Doc du lieu tu data Queue
+    if (xQueueReceive(
+          dataQueue,
+          &receivedData,
+          pdMS_TO_TICKS(100)
+        ) == pdPASS) {
+
+      // Gui gia tri Gas
+      char gasData[16];
+
+      snprintf(
+        gasData,
+        sizeof(gasData),
+        "%d",
+        receivedData.gasValue
+      );
+
+      mqttClient.publish(gasTopic, gasData);
+
+      // Gui nhiet do neu doc hop le
+      if (receivedData.tempValid) {
+
+        char tempData[16];
+
+        snprintf(
+          tempData,
+          sizeof(tempData),
+          "%.2f",
+          receivedData.temperature
+        );
+
+        mqttClient.publish(tempTopic, tempData);
+      }
+
+      Serial.println("Send data to MQTT successfully!");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// =================================
+// 11. TASK CANH BAO - CORE 1
+// =================================
+
+void TaskAlert(void *pvParameters) {
+
+  SensorData alertData;
+
+  for (;;) {
+
+    // Doc du lieu tu alert Queue
+    if (xQueueReceive(
+          alertQueue,
+          &alertData,
+          portMAX_DELAY
+        ) == pdPASS) {
+
+      // CANH BAO KHI GAS VUOT NGUONG
+      if (alertData.gasValue > GAS_THRESHOLD) {
+
+        digitalWrite(FAN_PIN, HIGH);
+
+        Serial.println("WARNING: HIGH GAS!");
+        Serial.println("FAN ON");
+
+      } else {
+
+        digitalWrite(FAN_PIN, LOW);
+
+        Serial.println("Gas normal - FAN OFF");
+      }
+
+      // CANH BAO KHI NHIET DO VUOT NGUONG
+      if (alertData.tempValid &&
+          alertData.temperature > TEMP_THRESHOLD) {
+
+        digitalWrite(PUMP_PIN, HIGH);
+
+        Serial.println("WARNING: HIGH TEMPERATURE!");
+        Serial.println("PUMP ON");
+
+      } else {
+
+        digitalWrite(PUMP_PIN, LOW);
+
+        Serial.println("Temperature normal - PUMP OFF");
+      }
+    }
+  }
+}
+
+// =================================
+// 12. SETUP
+// =================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // Khoi tao cam bien
+  dht.begin();
+
+  // Khoi tao chan dau ra
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
+
+  digitalWrite(PUMP_PIN, LOW);
+  digitalWrite(FAN_PIN, LOW);
+
+  // Cau hinh MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+
+  // Tao data Queue
+  dataQueue = xQueueCreate(
+    10,
+    sizeof(SensorData)
+  );
+
+  // Tao alert Queue
+  alertQueue = xQueueCreate(
+    1,
+    sizeof(SensorData)
+  );
+
+  // Kiem tra Queue
+  if (dataQueue == NULL || alertQueue == NULL) {
+
+    Serial.println("Queue creation failed!");
+
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  // =================================
+  // TAO 3 TASK
+  // =================================
+
+  // Task truyen data - Core 0
+  xTaskCreatePinnedToCore(
+    TaskSendData,
+    "TaskSendData",
+    8192,
+    NULL,
+    2,
+    NULL,
+    0
+  );
+
+  // Task doc data - Core 1
+  xTaskCreatePinnedToCore(
+    TaskReadData,
+    "TaskReadData",
+    4096,
+    NULL,
+    2,
+    NULL,
+    1
+  );
+
+  // Task canh bao - Core 1
+  xTaskCreatePinnedToCore(
+    TaskAlert,
+    "TaskAlert",
+    4096,
+    NULL,
+    3,
+    NULL,
+    1
+  );
+
+  Serial.println("FreeRTOS system started!");
+}
+
+// =================================
+// 13. LOOP
+// =================================
+
+void loop() {
+
+  // Cac cong viec chinh duoc xu ly
+  // boi 3 Task FreeRTOS
+
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
