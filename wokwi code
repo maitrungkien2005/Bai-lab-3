@@ -1,92 +1,96 @@
 
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <DHTesp.h>
+#include <DHT.h>
 
-// ================= WIFI =================
+// ===== KHAI BAO CHAN =====
+#define MQ2_PIN 34
+#define DHT_PIN 15
+#define DHT_TYPE DHT22
+
+#define PUMP_PIN 26
+#define FAN_PIN 27
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ===== WIFI =====
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 
-// ================= MQTT =================
-const char* mqtt_server = "broker.emqx.io";
+// ===== MQTT =====
+const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
 
-const char* TOPIC_TELEMETRY = "utc/firelab/telemetry";
-const char* TOPIC_FAN = "utc/firelab/fan/set";
-const char* TOPIC_PUMP = "utc/firelab/pump/set";
-
-// ================= GPIO =================
-#define MQ2_PIN       34
-#define DHT_PIN       15
-#define FAN_PIN       18
-#define PUMP_PIN       5
-#define ALARM_LED_PIN 23
-#define BUZZER_PIN    19
-
-// ================= NGUONG CANH BAO =================
-// Gia tri minh hoa de thu nghiem, can hieu chinh
-// theo cam bien va dieu kien thuc te.
-const int GAS_THRESHOLD = 1800;
-const float TEMP_THRESHOLD = 40.0;
-
-// ================= DOI TUONG =================
 WiFiClient espClient;
 PubSubClient client(espClient);
-DHTesp dht;
 
-// ================= TRANG THAI =================
-bool manualFan = false;
-bool manualPump = false;
+// ===== TOPIC =====
+const char* gasTopic = "firealarm/demo/gas";
+const char* tempTopic = "firealarm/demo/temperature";
 
-bool fanOn = false;
-bool pumpOn = false;
-bool alarmOn = false;
+const char* pumpCmd = "firealarm/demo/pump/cmd";
+const char* fanCmd = "firealarm/demo/fan/cmd";
 
-unsigned long lastPublish = 0;
-const unsigned long PUBLISH_INTERVAL = 2000;
+const char* pumpState = "firealarm/demo/pump/state";
+const char* fanState = "firealarm/demo/fan/state";
 
-// ================= NHAN LENH MQTT =================
+// ===== TRANG THAI =====
+bool pumpStatus = false;
+bool fanStatus = false;
+
+unsigned long lastSend = 0;
+
+// ===== DIEU KHIEN OUTPUT =====
+void updatePump(bool state) {
+  pumpStatus = state;
+  digitalWrite(PUMP_PIN, state ? HIGH : LOW);
+
+  client.publish(pumpState, state ? "ON" : "OFF");
+  Serial.println(state ? "PUMP: ON" : "PUMP: OFF");
+}
+
+void updateFan(bool state) {
+  fanStatus = state;
+  digitalWrite(FAN_PIN, state ? HIGH : LOW);
+
+  client.publish(fanState, state ? "ON" : "OFF");
+  Serial.println(state ? "FAN: ON" : "FAN: OFF");
+}
+
+// ===== NHAN LENH MQTT =====
 void callback(char* topic, byte* payload,
               unsigned int length) {
-  String topicName = String(topic);
+
   String message = "";
 
-  for (unsigned int i = 0; i < length; i++) {
+  for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
 
-  message.trim();
-  message.toUpperCase();
-
-  Serial.print("MQTT topic: ");
-  Serial.println(topicName);
-  Serial.print("Payload: ");
+  Serial.print("Nhan lenh: ");
   Serial.println(message);
 
-  if (topicName == TOPIC_FAN) {
+  if (strcmp(topic, pumpCmd) == 0) {
     if (message == "ON") {
-      manualFan = true;
+      updatePump(true);
     } else if (message == "OFF") {
-      manualFan = false;
+      updatePump(false);
     }
   }
 
-  if (topicName == TOPIC_PUMP) {
+  if (strcmp(topic, fanCmd) == 0) {
     if (message == "ON") {
-      manualPump = true;
+      updateFan(true);
     } else if (message == "OFF") {
-      manualPump = false;
+      updateFan(false);
     }
   }
 }
 
-// ================= KET NOI WIFI =================
+// ===== KET NOI WIFI =====
 void connectWiFi() {
-  Serial.println();
-  Serial.print("Connecting WiFi: ");
-  Serial.println(ssid);
+  Serial.print("Dang ket noi WiFi");
 
-  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -94,105 +98,60 @@ void connectWiFi() {
     Serial.print(".");
   }
 
-  Serial.println();
-  Serial.println("WiFi connected");
-  Serial.print("IP: ");
+  Serial.println("\nWiFi connected!");
   Serial.println(WiFi.localIP());
 }
 
-// ================= KET NOI MQTT =================
+// ===== KET NOI MQTT =====
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.print("Connecting MQTT...");
 
-    // Doi client ID rieng cho thiet bi
-    String clientId = "ESP32-FireAlarm-" +
-                      String((uint32_t)ESP.getEfuseMac(), HEX);
+    String clientId = "ESP32-FireAlarm-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
 
     if (client.connect(clientId.c_str())) {
-      Serial.println("MQTT connected");
+      Serial.println("Connected!");
 
-      client.subscribe(TOPIC_FAN);
-      client.subscribe(TOPIC_PUMP);
+      client.subscribe(pumpCmd);
+      client.subscribe(fanCmd);
 
-      Serial.println("Subscribed to fan/set and pump/set");
+      client.publish(pumpState,
+                      pumpStatus ? "ON" : "OFF");
+
+      client.publish(fanState,
+                      fanStatus ? "ON" : "OFF");
+
     } else {
-      Serial.print("Failed, state = ");
+      Serial.print("Failed, rc=");
       Serial.println(client.state());
-      Serial.println("Retry after 2 seconds");
       delay(2000);
     }
   }
 }
 
-// ================= DIEU KHIEN THIET BI =================
-void updateOutputs(bool gasDanger, bool tempDanger) {
-  // Dieu khien tu dong duoc uu tien khi co canh bao
-  fanOn = gasDanger || manualFan;
-  pumpOn = tempDanger || manualPump;
-  alarmOn = gasDanger || tempDanger;
-
-  digitalWrite(FAN_PIN, fanOn ? HIGH : LOW);
-  digitalWrite(PUMP_PIN, pumpOn ? HIGH : LOW);
-  digitalWrite(ALARM_LED_PIN, alarmOn ? HIGH : LOW);
-
-  if (alarmOn) {
-    tone(BUZZER_PIN, 2000);
-  } else {
-    noTone(BUZZER_PIN);
-  }
-}
-
-// ================= GUI TELEMETRY =================
-void publishTelemetry(float temperature, int gasValue) {
-  char json[180];
-
-  snprintf(
-    json,
-    sizeof(json),
-    "{\"temperature\":%.2f,\"gas\":%d,"
-    "\"fan\":%d,\"pump\":%d,\"alarm\":%d}",
-    temperature,
-    gasValue,
-    fanOn ? 1 : 0,
-    pumpOn ? 1 : 0,
-    alarmOn ? 1 : 0
-  );
-
-  if (client.publish(TOPIC_TELEMETRY, json)) {
-    Serial.print("Telemetry sent: ");
-    Serial.println(json);
-  } else {
-    Serial.println("Telemetry publish failed");
-  }
-}
-
-// ================= SETUP =================
+// ===== SETUP =====
 void setup() {
   Serial.begin(115200);
 
   pinMode(MQ2_PIN, INPUT);
-  pinMode(FAN_PIN, OUTPUT);
   pinMode(PUMP_PIN, OUTPUT);
-  pinMode(ALARM_LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
 
-  digitalWrite(FAN_PIN, LOW);
   digitalWrite(PUMP_PIN, LOW);
-  digitalWrite(ALARM_LED_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(FAN_PIN, LOW);
 
-  dht.setup(DHT_PIN, DHTesp::DHT22);
+  dht.begin();
 
   connectWiFi();
 
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
-  client.setBufferSize(256);
 }
 
-// ================= LOOP =================
+// ===== LOOP =====
 void loop() {
+
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
@@ -203,42 +162,44 @@ void loop() {
 
   client.loop();
 
-  // Doc cam bien
-  int gasValue = analogRead(MQ2_PIN);
-  TempAndHumidity data = dht.getTempAndHumidity();
+  if (millis() - lastSend >= 2000) {
+    lastSend = millis();
 
-  // Tranh xu ly neu DHT22 chua co du lieu hop le
-  if (isnan(data.temperature)) {
-    Serial.println("DHT22 read error");
-    delay(500);
-    return;
+    // Doc cam bien MQ2
+    int gasValue = analogRead(MQ2_PIN);
+
+    // Doc nhiet do DHT22
+    float temperature = dht.readTemperature();
+
+    // Hien thi Serial
+    Serial.println("===== FIRE ALARM =====");
+
+    Serial.print("Gas: ");
+    Serial.println(gasValue);
+
+    if (!isnan(temperature)) {
+      Serial.print("Temperature: ");
+      Serial.print(temperature);
+      Serial.println(" *C");
+
+      // Gui nhiet do len MQTT
+      char tempData[16];
+      snprintf(tempData, sizeof(tempData),
+               "%.2f", temperature);
+
+      client.publish(tempTopic, tempData);
+
+    } else {
+      Serial.println("DHT22 reading error!");
+    }
+
+    // Gui gia tri MQ2 len MQTT
+    char gasData[16];
+    snprintf(gasData, sizeof(gasData),
+             "%d", gasValue);
+
+    client.publish(gasTopic, gasData);
+
+    Serial.println("======================");
   }
-
-  float temperature = data.temperature;
-
-  bool gasDanger = gasValue >= GAS_THRESHOLD;
-  bool tempDanger = temperature >= TEMP_THRESHOLD;
-
-  updateOutputs(gasDanger, tempDanger);
-
-  // In thong tin ra Serial Monitor
-  Serial.print("Gas: ");
-  Serial.print(gasValue);
-  Serial.print(" | Temperature: ");
-  Serial.print(temperature);
-  Serial.print(" C | Fan: ");
-  Serial.print(fanOn ? "ON" : "OFF");
-  Serial.print(" | Pump: ");
-  Serial.print(pumpOn ? "ON" : "OFF");
-  Serial.print(" | Alarm: ");
-  Serial.println(alarmOn ? "ON" : "OFF");
-
-  // Gui telemetry moi 2 giay
-  if (millis() - lastPublish >= PUBLISH_INTERVAL) {
-    lastPublish = millis();
-    publishTelemetry(temperature, gasValue);
-  }
-
-  delay(2000);
 }
-
